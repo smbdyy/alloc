@@ -151,7 +151,7 @@ namespace memmanagment {
 
                         if (std::all_of(std::next(it), range_end, is_free)) {
                             std::fill(it, range_end, true);
-
+                            xSemaphoreGive(pool_mutex);
                             return ptr;
                         }
                     }
