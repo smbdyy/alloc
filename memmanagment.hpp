@@ -11,6 +11,7 @@
 #include <type_traits>
 #include <iostream>
 #include <vector>
+#include <freertos/semphr.h>
 
 #ifdef __FUNCSIG__
 #define __PRETTY_FUNCTION__ __FUNCSIG__
@@ -85,8 +86,6 @@ namespace memmanagment {
         std::vector<bool, vec_all<bool, chunks_cnt>> chunk_reserved;
       } pool{};
 
-      std::mutex pool_mutex;
-
       static constexpr std::size_t bytes_cnt2chunks_cnt(std::size_t const bytes_cnt) noexcept
       {
         return div_with_round(bytes_cnt, sizeof(pool.chunk[0]));
@@ -100,50 +99,70 @@ namespace memmanagment {
         return  (a - b) / sizeof(pool.chunk[0]);
       }
 
+      SemaphoreHandle_t pool_mutex;
+
     public:
 
       inline mem_pool()
       {
           pool.chunk_reserved.resize(chunks_cnt);
+          pool_mutex = xSemaphoreCreateMutex();
+          if (pool_mutex == nullptr) {
+              std::cerr << __PRETTY_FUNCTION__ << ": Failed to create mutex" << std::endl;
+              exit(EXIT_FAILURE);
+          }
       }
 
       [[nodiscard]]
       inline void *allocate(std::size_t const bytes_cnt, std::size_t const alignment = max_align) noexcept
       {
-        if (bytes_cnt == 0)
-          return &pool.chunk[0];
-
-        auto const &&is_free = [](auto const &a){return !a;};
-        auto const &&get_chunk = [this](auto const info_it) {
-          std::size_t const index(std::distance(std::begin(pool.chunk_reserved), info_it));
-          return &pool.chunk[index];
-        };
-
-
-        for( auto it = std::begin(pool.chunk_reserved), end{std::end(pool.chunk_reserved)}; it != end;
-            it = std::find_if(std::next(it), end, is_free)) {
-          void *ptr{get_chunk(it)};
-          std::size_t space{sizeof pool.chunk[0]};
-
-          if (std::align(alignment, 0, ptr, space)) {
-
-            if (bytes_cnt <= space) {
-              *it = false;
-              return ptr;
+        if (xSemaphoreTake(pool_mutex, portMAX_DELAY) == pdTRUE) {
+            if (bytes_cnt == 0) {
+                xSemaphoreGive(pool_mutex);
+                return &pool.chunk[0];
             }
 
-            decltype(std::distance(it, end)) const
-                additional_chunks_needed(div_with_round(bytes_cnt - space, sizeof pool.chunk[0]));
 
-            if (std::distance(it, end) >= additional_chunks_needed) {
-              auto range_end = std::next(it, additional_chunks_needed + 1);
+            auto const &&is_free = [](auto const &a){return !a;};
+            auto const &&get_chunk = [this](auto const info_it) {
+                std::size_t const index(std::distance(std::begin(pool.chunk_reserved), info_it));
+                xSemaphoreGive(pool_mutex);
+                return &pool.chunk[index];
+            };
 
-              if (std::all_of(std::next(it), range_end, is_free)) {
-                std::fill(it, range_end, true);
-                return ptr;
-              }
+            for( auto it = std::begin(pool.chunk_reserved), end{std::end(pool.chunk_reserved)}; it != end;
+                 it = std::find_if(std::next(it), end, is_free)) {
+                void *ptr{get_chunk(it)};
+                std::size_t space{sizeof pool.chunk[0]};
+
+                if (std::align(alignment, 0, ptr, space)) {
+
+                    if (bytes_cnt <= space) {
+                        *it = false;
+                        xSemaphoreGive(pool_mutex);
+                        return ptr;
+                    }
+
+                    decltype(std::distance(it, end)) const
+                            additional_chunks_needed(div_with_round(bytes_cnt - space, sizeof pool.chunk[0]));
+
+                    if (std::distance(it, end) >= additional_chunks_needed) {
+                        auto range_end = std::next(it, additional_chunks_needed + 1);
+
+                        if (std::all_of(std::next(it), range_end, is_free)) {
+                            std::fill(it, range_end, true);
+
+                            return ptr;
+                        }
+                    }
+                }
             }
-          }
+
+            xSemaphoreGive(pool_mutex);
+        }
+        else {
+            std::cerr << __PRETTY_FUNCTION__ << ": Failed to lock pool mutex" << std::endl;
+            exit(EXIT_FAILURE);
         }
 
         return nullptr;
@@ -160,9 +179,14 @@ namespace memmanagment {
         std::size_t const last_chunk_index{get_chunk_index_by_ptr(reinterpret_cast<std::uint8_t *>(ptr) + bytes_cnt)};
         std::size_t const chunks2deallocate{last_chunk_index - first_chunk_index + 1};
 
-        std::lock_guard<std::mutex> guard{pool_mutex};
-
-        std::fill_n(std::next(std::begin(pool.chunk_reserved), first_chunk_index), chunks2deallocate, false);
+        if (xSemaphoreTake(pool_mutex, portMAX_DELAY) == pdTRUE) {
+          std::fill_n(std::next(std::begin(pool.chunk_reserved), first_chunk_index), chunks2deallocate, false);
+          xSemaphoreGive(pool_mutex);
+        }
+        else {
+          std::cerr << __PRETTY_FUNCTION__ << ": Failed to lock pool mutex" << std::endl;
+          exit(EXIT_FAILURE);
+        }
       }
   };
 
